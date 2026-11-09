@@ -1,4 +1,9 @@
 {
-  "config": { "file": "calls.jsonl", "includeEncrypted": false },
-  "systems": { "sys1": { "label": "County" } }
+  "config": {
+    "script": "/trunk/unit-script.sh",
+    "workdir": "/trunk",
+    "actions": ["on", "off", "join", "call", "location"],
+    "timeoutS": 20
+  },
+  "systems": {}
 }

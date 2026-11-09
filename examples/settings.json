@@ -1,0 +1,4 @@
+{
+  "config": { "file": "calls.jsonl", "includeEncrypted": false },
+  "systems": { "sys1": { "label": "County" } }
+}

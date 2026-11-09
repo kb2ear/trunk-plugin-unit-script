@@ -1,0 +1,23 @@
+[package]
+# Your plugin's id: lowercase letters, digits and dashes. It names the
+# executable, the release files and the plugin's entry in the registry.
+name = "call-log"
+version = "0.1.0"
+edition = "2024"
+description = "Writes a line of JSON for every recorded call."
+license = "MIT"
+repository = "https://github.com/YOUR-NAME/call-log"
+authors = ["Your Name <you@example.com>"]
+publish = false
+
+[dependencies]
+trunk-recorder-plugin = "0.5.0"
+# The settings form is drawn from your config structs' JSON Schema. Keep the
+# major version the SDK uses (1).
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+strip = true
+lto = true

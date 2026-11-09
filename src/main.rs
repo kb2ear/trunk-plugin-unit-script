@@ -5,19 +5,22 @@
 //! with the actions Trunk Recorder used: `on`, `off`, `join`, `call`,
 //! `location`, `ackresp`, `data`, `ans_req` (plus `call_alert` and
 //! `emergency`). Scripts run one at a time on a thread of their own, so a slow
-//! script never holds up the recorder.
+//! script never holds up the recorder. Like Trunk Recorder's per-system
+//! `unitScript`, conventional systems are left out unless asked for.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use trunk_recorder_plugin::{CallInfo, Host, Manifest, NoConfig, Plugin, Setup, State, UnitEvent, topic};
+use trunk_recorder_plugin::{CallInfo, Host, Manifest, Metrics, NoConfig, Plugin, Setup, State, UnitEvent, topic};
 
 /// How many runs may wait before events are dropped.
 const QUEUE: usize = 5000;
@@ -103,6 +106,17 @@ struct Config {
     /// A run of the script that takes longer than this is stopped.
     #[schemars(range(min = 1, max = 300))]
     timeout_s: u64,
+    /// Systems
+    ///
+    /// Which systems run the script. None ticked: every trunked system (and the
+    /// conventional ones too, with Include conventional systems).
+    #[schemars(extend("x-systems" = true))]
+    systems: Vec<String>,
+    /// Include conventional systems
+    ///
+    /// With no systems ticked, run the script for conventional systems too. They
+    /// have no registrations or affiliations: only `call`, for the radios heard.
+    include_conventional: bool,
 }
 
 impl Default for Config {
@@ -112,6 +126,8 @@ impl Default for Config {
             workdir: String::new(),
             actions: vec![Action::On, Action::Off, Action::Join, Action::Call, Action::Location],
             timeout_s: 20,
+            systems: Vec::new(),
+            include_conventional: false,
         }
     }
 }
@@ -157,6 +173,50 @@ fn is_executable(p: &Path) -> bool {
     p.is_file()
 }
 
+/// What the worker has done, for the plugin's card.
+#[derive(Default)]
+struct Stats {
+    runs: AtomicU64,
+    failed: AtomicU64,
+    timed_out: AtomicU64,
+    dropped: AtomicU64,
+    /// Waiting to run (queued, not yet started).
+    waiting: AtomicU64,
+    last: Mutex<Last>,
+}
+
+/// The latest outcomes, Unix seconds.
+#[derive(Default)]
+struct Last {
+    ok: Option<f64>,
+    error: Option<f64>,
+    error_text: String,
+    /// A run's time, smoothed, ms.
+    run_ms: Option<f64>,
+}
+
+impl Stats {
+    fn metrics(&self) -> Metrics {
+        let last = self.last.lock().unwrap();
+        let mut m = Metrics {
+            queued: Some(self.waiting.load(Ordering::Relaxed)),
+            latency_ms: last.run_ms,
+            last_ok: last.ok,
+            last_error: last.error,
+            last_error_text: last.error_text.clone(),
+            ..Default::default()
+        };
+        for (k, v) in [("runs", &self.runs), ("failed", &self.failed), ("timed out", &self.timed_out), ("dropped", &self.dropped)] {
+            m.extra.insert(k.into(), v.load(Ordering::Relaxed).into());
+        }
+        m
+    }
+}
+
+fn now_s() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
+}
+
 /// One run of the script.
 struct Job {
     target: Target,
@@ -171,7 +231,7 @@ struct UnitScript {
     calls: HashMap<u32, HashSet<u32>>,
     jobs: Option<SyncSender<Job>>,
     worker: Option<JoinHandle<()>>,
-    dropped: u64,
+    stats: Arc<Stats>,
 }
 
 impl UnitScript {
@@ -186,12 +246,15 @@ impl UnitScript {
         };
         let Some(tx) = &self.jobs else { return };
         match tx.try_send(job) {
-            Ok(()) => {}
+            Ok(()) => {
+                self.stats.waiting.fetch_add(1, Ordering::Relaxed);
+            }
             Err(TrySendError::Full(_)) => {
-                self.dropped += 1;
-                if self.dropped % 100 == 1 {
-                    self.host.warn(format!("the script can't keep up: {} event(s) dropped", self.dropped));
-                    self.host.status(State::Warning, format!("{} event(s) dropped: the script is too slow", self.dropped));
+                let dropped = self.stats.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                if dropped % 100 == 1 {
+                    self.host.warn(format!("the script can't keep up: {dropped} event(s) dropped"));
+                    self.host.status(State::Warning, format!("{dropped} event(s) dropped: the script is too slow"));
+                    self.host.metrics(&self.stats.metrics());
                 }
             }
             Err(TrySendError::Disconnected(_)) => {}
@@ -212,16 +275,54 @@ impl UnitScript {
     }
 }
 
+/// How often the card's figures are sent, at most.
+const METRICS_EVERY: Duration = Duration::from_secs(5);
+
 /// Runs the queued jobs in order until the channel closes.
-fn work(host: Host, rx: Receiver<Job>) {
+fn work(host: Host, rx: Receiver<Job>, stats: Arc<Stats>) {
+    let mut sent = Instant::now() - METRICS_EVERY;
     for job in rx {
+        stats.waiting.fetch_sub(1, Ordering::Relaxed);
         let what = job.args.join(" ");
-        match run(&job) {
+        let t = Instant::now();
+        let outcome = run(&job);
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        stats.runs.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut last = stats.last.lock().unwrap();
+            last.run_ms = Some(last.run_ms.map_or(ms, |avg| avg * 0.9 + ms * 0.1));
+            match &outcome {
+                Ok(None) => last.ok = Some(now_s()),
+                Ok(Some(problem)) => {
+                    last.error = Some(now_s());
+                    last.error_text = format!("{what}: {problem}");
+                }
+                Err(e) => {
+                    last.error = Some(now_s());
+                    last.error_text = format!("can't run {}: {e}", job.target.script.display());
+                }
+            }
+        }
+        match outcome {
             Ok(None) => {}
-            Ok(Some(problem)) => host.warn(format!("{what}: {problem}")),
-            Err(e) => host.error(format!("can't run {}: {e}", job.target.script.display())),
+            Ok(Some(problem)) => {
+                stats.failed.fetch_add(1, Ordering::Relaxed);
+                if problem.starts_with("timed out") {
+                    stats.timed_out.fetch_add(1, Ordering::Relaxed);
+                }
+                host.warn(format!("{what}: {problem}"));
+            }
+            Err(e) => {
+                stats.failed.fetch_add(1, Ordering::Relaxed);
+                host.error(format!("can't run {}: {e}", job.target.script.display()));
+            }
+        }
+        if sent.elapsed() >= METRICS_EVERY {
+            host.metrics(&stats.metrics());
+            sent = Instant::now();
         }
     }
+    host.metrics(&stats.metrics());
 }
 
 /// Run one job: None when it exited 0, else what went wrong.
@@ -274,14 +375,34 @@ impl Plugin for UnitScript {
     }
 
     fn start(host: Host, setup: Setup<Config, NoConfig>) -> Result<Self, String> {
+        let chosen: HashSet<&str> = setup.config.systems.iter().map(String::as_str).collect();
+        for name in &chosen {
+            if setup.system_named(name).is_none() {
+                host.warn(format!("{name} is ticked under Systems but isn't one of the recorder's systems"));
+            }
+        }
         let mut targets = HashMap::new();
+        let mut left_out = Vec::new();
         for s in &setup.systems {
+            let wanted = if chosen.is_empty() { s.kind != "conventional" || setup.config.include_conventional } else { chosen.contains(s.short_name.as_str()) };
+            if !wanted {
+                left_out.push(s.short_name.clone());
+                continue;
+            }
             if let Some(t) = Target::of(&s.short_name, &s.settings)? {
                 targets.insert(s.short_name.clone(), t);
             }
         }
+        if !left_out.is_empty() {
+            left_out.sort();
+            host.info(format!("not running the script for {}", left_out.join(", ")));
+        }
         if targets.is_empty() {
-            return Err("Set the script to run (Script).".into());
+            return Err(if setup.config.script.trim().is_empty() {
+                "Set the script to run (Script).".into()
+            } else {
+                "No system runs the script: tick some under Systems, or turn on Include conventional systems.".into()
+            });
         }
         for (name, t) in &targets {
             let mut actions: Vec<&str> = t.actions.iter().map(|a| a.as_str()).collect();
@@ -289,10 +410,12 @@ impl Plugin for UnitScript {
             host.info(format!("{name}: {} in {} for {}", t.script.display(), t.workdir.display(), actions.join(", ")));
         }
         let (tx, rx) = mpsc::sync_channel(QUEUE);
-        let worker_host = host.clone();
-        let worker = thread::spawn(move || work(worker_host, rx));
+        let stats = Arc::new(Stats::default());
+        let (worker_host, worker_stats) = (host.clone(), stats.clone());
+        let worker = thread::spawn(move || work(worker_host, rx, worker_stats));
         host.status(State::Ok, format!("running the script for {} system(s)", targets.len()));
-        Ok(UnitScript { host, targets, calls: HashMap::new(), jobs: Some(tx), worker: Some(worker), dropped: 0 })
+        host.metrics(&stats.metrics());
+        Ok(UnitScript { host, targets, calls: HashMap::new(), jobs: Some(tx), worker: Some(worker), stats })
     }
 
     fn unit(&mut self, e: UnitEvent) {
@@ -405,6 +528,89 @@ mod tests {
         ]);
         assert!(out.ready());
         assert_eq!(log(&dir), ["sys1 3 ackresp ", "sys1 4 emergency 5"]);
+    }
+
+    /// A hello with a conventional system beside the trunked `sys1`.
+    fn with_conventional(dir: &Path, config: Value) -> trunk_recorder_plugin::Hello {
+        let mut hello = testing::hello(dir, config);
+        let mut conv = hello.systems[0].clone();
+        conv.index = 1;
+        conv.short_name = "conv".into();
+        conv.kind = "conventional".into();
+        hello.systems.push(conv);
+        hello
+    }
+
+    fn conv_call(id: u32, units: &[u32]) -> HostMessage {
+        HostMessage::CallStart(CallInfo { id, short_name: "conv".into(), talkgroup: 1, units: units.to_vec(), ..Default::default() })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conventional_systems_are_left_out_unless_asked_for() {
+        let dir = testing::temp_dir("unit-script");
+        let s = script(&dir);
+        let out = testing::run::<UnitScript>([
+            HostMessage::Hello(with_conventional(&dir, json!({ "script": s }))),
+            conv_call(1, &[77]),
+            HostMessage::CallStart(call(2, 100, &[88])),
+        ]);
+        assert!(out.ready());
+        assert_eq!(log(&dir), ["sys1 88 call 100"]);
+        assert!(out.logs().iter().any(|(_, m)| m == "not running the script for conv"), "{:?}", out.logs());
+
+        let dir = testing::temp_dir("unit-script");
+        let s = script(&dir);
+        let out =
+            testing::run::<UnitScript>([HostMessage::Hello(with_conventional(&dir, json!({ "script": s, "includeConventional": true }))), conv_call(1, &[77])]);
+        assert!(out.ready());
+        assert_eq!(log(&dir), ["conv 77 call 1"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systems_ticked_are_the_only_ones() {
+        let dir = testing::temp_dir("unit-script");
+        let s = script(&dir);
+        let out = testing::run::<UnitScript>([
+            HostMessage::Hello(with_conventional(&dir, json!({ "script": s, "systems": ["conv"] }))),
+            conv_call(1, &[77]),
+            unit("registration", 5, None),
+        ]);
+        assert!(out.ready());
+        assert_eq!(log(&dir), ["conv 77 call 1"], "sys1 isn't ticked");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nothing_to_run_for_is_a_settings_error() {
+        let dir = testing::temp_dir("unit-script");
+        let s = script(&dir);
+        let mut hello = testing::hello(&dir, json!({ "script": s }));
+        hello.systems[0].kind = "conventional".into();
+        let out = testing::run::<UnitScript>([HostMessage::Hello(hello)]);
+        assert!(!out.ready());
+        assert!(out.status().is_some_and(|(_, m)| m.contains("Include conventional")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_card_gets_its_figures() {
+        let dir = testing::temp_dir("unit-script");
+        let p = dir.join("bad.sh");
+        std::fs::write(&p, "#!/bin/sh\n[ \"$3\" = on ] && exit 0\necho nope >&2\nexit 1\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = testing::run::<UnitScript>([
+            HostMessage::Hello(testing::hello(&dir, json!({ "script": p }))),
+            unit("registration", 1, None),
+            unit("deregistration", 1, None),
+        ]);
+        let last = out.metrics().pop().expect("metrics sent");
+        assert_eq!(last.extra["runs"], 2);
+        assert_eq!(last.extra["failed"], 1);
+        assert_eq!(last.queued, Some(0));
+        assert!(last.last_ok.is_some() && last.last_error_text.contains("nope"), "{last:?}");
     }
 
     #[test]

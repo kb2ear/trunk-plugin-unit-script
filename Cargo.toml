@@ -11,7 +11,7 @@ authors = ["Scott Weis <kb2ear@kb2ear.net>"]
 publish = false
 
 [dependencies]
-trunk-recorder-plugin = "0.8.0"
+trunk-recorder-plugin = "0.10.0"
 # The settings form is drawn from your config structs' JSON Schema. Keep the
 # major version the SDK uses (1).
 schemars = "1"

@@ -3,7 +3,7 @@
 # executable, the release files and the plugin's entry in the registry.
 name = "unit-script"
 version = "0.1.0"
-edition = "2026"
+edition = "2024"
 description = "Runs a Trunk Recorder-style unitScript for radio registrations, affiliations, locations and calls."
 license = "MIT"
 repository = "https://github.com/kb2ear/trunk-plugin-unit-script"
@@ -11,7 +11,7 @@ authors = ["Scott Weis <kb2ear@kb2ear.net>"]
 publish = false
 
 [dependencies]
-trunk-recorder-plugin = "0.8.0"
+trunk-recorder-plugin = "0.5.0"
 # The settings form is drawn from your config structs' JSON Schema. Keep the
 # major version the SDK uses (1).
 schemars = "1"

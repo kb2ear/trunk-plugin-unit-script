@@ -36,16 +36,24 @@ you tick them or turn on **Include conventional systems**. They have no registra
 affiliations, so for them the script only gets `call`, for each radio heard (P25 / DMR IDs, MDC,
 FleetSync). The plugin's log names the systems left out at start.
 
-A system can override Script, Working folder, Actions and Timeout for itself (its card's
-*settings for this system*), to run another script for it.
+A system can override Script, Working folder, Actions and Timeout for itself (on its card under
+**Plugins** > **Unit script**), to run another script for it. Those four are the only settings a
+system can set again; **Systems** and **Include conventional systems** are for the whole recorder.
+This needs Trunk Recorder Pro 0.4.0 or later (plugin SDK 0.13.0+), where a system's card offers
+only the settings its plugin names. The recorder's own **Systems** switch on a plugin's card
+(Setup > Plugins) also turns this plugin off for a system, beside this plugin's own **Systems**.
 
 ## How it runs
 
 - Runs happen one at a time, in order, on a thread of their own: a slow script never holds up the
   recorder. Up to 5000 runs can wait; past that, events are dropped and the plugin's card warns.
-- The plugin's card shows runs, failures, timeouts, drops, runs waiting, the run time and the
-  last success and error (every few seconds while it works). Its Sent / Failed figures, which
-  count recorded calls, stay at 0: this plugin doesn't take recorded calls.
+- The plugin's card counts recorded calls as other plugins' do: **Sent** for a call from a system
+  that runs the script for `call`, **Skipped** for one that doesn't (a conventional system left
+  out, or `call` not ticked under **Actions**), with **Last success** and the age at delivery to
+  match. The plugin reports on each call as soon as it is recorded, so it never holds a call's
+  files back from the recorder's **Archive** settings. Failed scripts aren't failed calls: they
+  are counted on the plugin's own line (script runs, script failures, timed out, dropped, runs
+  waiting, the run time and the last error), updated every few seconds while it works.
 - A run that exits non-zero is logged with the last line it wrote to stderr; one that times out is
   stopped and logged.
 - A radio that keys up partway through a call is passed as `call` when the call ends.

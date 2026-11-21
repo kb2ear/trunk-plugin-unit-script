@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use trunk_recorder_plugin::{CallInfo, Host, Manifest, Metrics, NoConfig, Plugin, Setup, State, UnitEvent, topic};
+use trunk_recorder_plugin::{CallInfo, ConcludedCall, Host, Manifest, Metrics, NoConfig, Outcome, Plugin, Setup, State, UnitEvent, topic};
 
 /// How many runs may wait before events are dropped.
 const QUEUE: usize = 5000;
@@ -83,7 +83,8 @@ impl Action {
     }
 }
 
-/// The plugin's settings. A system can override any of them for itself.
+/// The plugin's settings. A system can override Script, Working folder, Actions and
+/// Timeout for itself (`system_overrides` in the manifest).
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 struct Config {
@@ -206,7 +207,7 @@ impl Stats {
             last_error_text: last.error_text.clone(),
             ..Default::default()
         };
-        for (k, v) in [("runs", &self.runs), ("failed", &self.failed), ("timed out", &self.timed_out), ("dropped", &self.dropped)] {
+        for (k, v) in [("script runs", &self.runs), ("script failures", &self.failed), ("timed out", &self.timed_out), ("dropped", &self.dropped)] {
             m.extra.insert(k.into(), v.load(Ordering::Relaxed).into());
         }
         m
@@ -369,7 +370,11 @@ impl Plugin for UnitScript {
     fn manifest() -> Manifest {
         Manifest {
             name: "Unit script".into(),
-            subscribe: vec![topic::UNIT.into(), topic::CALL_START.into(), topic::CALL_END.into()],
+            subscribe: vec![topic::UNIT.into(), topic::CALL_START.into(), topic::CALL_END.into(), topic::CALL_CONCLUDED.into()],
+            // A system may set these again for itself (SDK 0.13.0+: a system's card
+            // offers only what the plugin names here). Systems and Include
+            // conventional systems stay whole-recorder settings.
+            system_overrides: vec!["script".into(), "workdir".into(), "actions".into(), "timeoutS".into()],
             ..trunk_recorder_plugin::manifest!()
         }
     }
@@ -430,6 +435,19 @@ impl Plugin for UnitScript {
 
     fn call_end(&mut self, call: CallInfo) {
         self.call_units(&call, true);
+    }
+
+    /// The recorder keeps a recorded call's files until every plugin taking recorded calls has
+    /// reported on it, and counts those results on the plugin's card (Sent, Skipped, Last
+    /// success, age at delivery). The radios heard were passed to the script as the call
+    /// ended, so there is nothing more to wait for: say what became of the call now.
+    fn call_concluded(&mut self, call: ConcludedCall) {
+        let (outcome, message) = match self.targets.get(call.call.short_name.as_str()) {
+            Some(t) if t.actions.contains(&Action::Call) => (Outcome::Ok, ""),
+            Some(_) => (Outcome::Skipped, "the call action is off for this system"),
+            None => (Outcome::Skipped, "this system doesn't run the script"),
+        };
+        self.host.call_result(&call.path, outcome, message, "");
     }
 
     fn shutdown(&mut self, grace: Duration) {
@@ -530,6 +548,75 @@ mod tests {
         assert_eq!(log(&dir), ["sys1 3 ackresp ", "sys1 4 emergency 5"]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_system_can_set_its_own_actions() {
+        let dir = testing::temp_dir("unit-script");
+        let s = script(&dir);
+        let mut hello = testing::hello(&dir, json!({ "script": s }));
+        // The host sends a system's settings whole: the plugin's own, with its overrides applied.
+        hello.systems[0].settings = json!({ "script": s, "actions": ["ackresp"] });
+        let out = testing::run::<UnitScript>([HostMessage::Hello(hello), unit("affiliation", 1, Some(2)), unit("acknowledge", 3, None)]);
+        assert!(out.ready());
+        assert_eq!(log(&dir), ["sys1 3 ackresp "]);
+    }
+
+    /// Every setting the manifest lets a system set again is one the form has.
+    #[test]
+    fn overrides_are_settings_the_plugin_has() {
+        let manifest = <UnitScript as Plugin>::manifest();
+        let schema = serde_json::to_value(schemars::schema_for!(Config)).unwrap();
+        let props = schema["properties"].as_object().expect("properties");
+        assert!(!manifest.system_overrides.is_empty());
+        for name in &manifest.system_overrides {
+            assert!(props.contains_key(name), "{name} is not a setting");
+        }
+        for whole_recorder in ["systems", "includeConventional"] {
+            assert!(!manifest.system_overrides.iter().any(|n| n == whole_recorder), "{whole_recorder} must stay whole-recorder");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_recorded_call_is_reported_on() {
+        let dir = testing::temp_dir("unit-script");
+        let s = script(&dir);
+        let out = testing::run::<UnitScript>([
+            HostMessage::Hello(testing::hello(&dir, json!({ "script": s }))),
+            HostMessage::CallConcluded(testing::call(&dir, "sys1", 100)),
+        ]);
+        assert!(out.ready());
+        let results = out.results();
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].1, Outcome::Ok, "{results:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_call_the_script_isnt_run_for_is_skipped() {
+        // Conventional systems are left out unless asked for: skipped, not ok.
+        let dir = testing::temp_dir("unit-script");
+        let s = script(&dir);
+        let out = testing::run::<UnitScript>([
+            HostMessage::Hello(with_conventional(&dir, json!({ "script": s }))),
+            HostMessage::CallConcluded(testing::call(&dir, "conv", 1)),
+        ]);
+        assert!(out.ready());
+        let results = out.results();
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].1, Outcome::Skipped, "{results:?}");
+
+        // The call action turned off: skipped too.
+        let dir = testing::temp_dir("unit-script");
+        let s = script(&dir);
+        let out = testing::run::<UnitScript>([
+            HostMessage::Hello(testing::hello(&dir, json!({ "script": s, "actions": ["on"] }))),
+            HostMessage::CallConcluded(testing::call(&dir, "sys1", 100)),
+        ]);
+        assert!(out.ready());
+        assert_eq!(out.results()[0].1, Outcome::Skipped, "{:?}", out.results());
+    }
+
     /// A hello with a conventional system beside the trunked `sys1`.
     fn with_conventional(dir: &Path, config: Value) -> trunk_recorder_plugin::Hello {
         let mut hello = testing::hello(dir, config);
@@ -607,8 +694,8 @@ mod tests {
             unit("deregistration", 1, None),
         ]);
         let last = out.metrics().pop().expect("metrics sent");
-        assert_eq!(last.extra["runs"], 2);
-        assert_eq!(last.extra["failed"], 1);
+        assert_eq!(last.extra["script runs"], 2);
+        assert_eq!(last.extra["script failures"], 1);
         assert_eq!(last.queued, Some(0));
         assert!(last.last_ok.is_some() && last.last_error_text.contains("nope"), "{last:?}");
     }

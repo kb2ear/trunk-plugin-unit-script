@@ -7,6 +7,10 @@
 //! `emergency`). Scripts run one at a time on a thread of their own, so a slow
 //! script never holds up the recorder. Like Trunk Recorder's per-system
 //! `unitScript`, conventional systems are left out unless asked for.
+//!
+//! A system, and each site of a system with several, can have a script of its
+//! own. `<shortName>` is the site's name on a system with several sites (each
+//! was a system of its own in Trunk Recorder), else the system's short name.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -20,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use trunk_recorder_plugin::{CallInfo, ConcludedCall, Host, Manifest, Metrics, NoConfig, Outcome, Plugin, Setup, State, UnitEvent, topic};
+use trunk_recorder_plugin::{CallInfo, ConcludedCall, Host, Manifest, Metrics, Outcome, Plugin, Setup, State, UnitEvent, topic};
 
 /// How many runs may wait before events are dropped.
 const QUEUE: usize = 5000;
@@ -83,8 +87,8 @@ impl Action {
     }
 }
 
-/// The plugin's settings. A system can override Script, Working folder, Actions and
-/// Timeout for itself (`system_overrides` in the manifest).
+/// The plugin's settings. A system, and each site of one with several, can set Script,
+/// Working folder, Actions and Timeout again for itself ([`Own`]).
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 struct Config {
@@ -133,8 +137,52 @@ impl Default for Config {
     }
 }
 
-/// What to run for one system.
-#[derive(Clone, Debug)]
+/// Settings for a system (on its card), and for each site of a system with several
+/// (a row for each on the system's card). Empty: as the plugin's; a site's: as its system's.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+struct Own {
+    /// Script
+    ///
+    /// The unitScript to run for this system or site. Empty: the plugin's.
+    script: String,
+    /// Working folder
+    ///
+    /// Where it runs. Empty: the plugin's (with none there either, the script's own folder).
+    workdir: String,
+    /// Actions
+    ///
+    /// Which actions to pass to it. None ticked: the plugin's.
+    actions: Vec<Action>,
+    /// Timeout, s
+    ///
+    /// A run that takes longer than this is stopped. Empty: the plugin's.
+    #[schemars(range(min = 1, max = 300))]
+    timeout_s: Option<u64>,
+}
+
+impl Own {
+    /// The plugin's settings `c` with those set here.
+    fn over(&self, c: &Config) -> Config {
+        let mut e = c.clone();
+        if !self.script.trim().is_empty() {
+            e.script = self.script.clone();
+        }
+        if !self.workdir.trim().is_empty() {
+            e.workdir = self.workdir.clone();
+        }
+        if !self.actions.is_empty() {
+            e.actions = self.actions.clone();
+        }
+        if let Some(t) = self.timeout_s {
+            e.timeout_s = t;
+        }
+        e
+    }
+}
+
+/// What to run for one system or site.
+#[derive(Clone, Debug, PartialEq)]
 struct Target {
     script: PathBuf,
     workdir: PathBuf,
@@ -222,12 +270,38 @@ fn now_s() -> f64 {
 struct Job {
     target: Target,
     args: [String; 4],
+    env: [(&'static str, String); 4],
+}
+
+/// Where an event came from.
+struct Origin<'a> {
+    short_name: &'a str,
+    system_id: u32,
+    /// The site's name; empty for none (a conventional system).
+    site: &'a str,
+    site_id: u32,
+}
+
+impl Origin<'_> {
+    /// `<shortName>` for the script: the site's name on a system with several sites (each was
+    /// a system of its own in Trunk Recorder), else the system's short name. A system of one
+    /// site names it by its short name, so the site's name serves both.
+    fn name(&self) -> &str {
+        if self.site.is_empty() { self.short_name } else { self.site }
+    }
+}
+
+fn id_text(id: u32) -> String {
+    if id == 0 { String::new() } else { id.to_string() }
 }
 
 struct UnitScript {
     host: Host,
-    /// By system short name: what to run (systems without a script aren't here).
-    targets: HashMap<String, Target>,
+    /// What to run, by system short name and site id (0: the system's, for its sites
+    /// without their own). Systems without a script aren't here.
+    targets: HashMap<(String, u32), Target>,
+    /// The ids of each system's sites the plugin is on for (empty: none listed).
+    sites_on: HashMap<String, HashSet<u32>>,
     /// Radios already passed as `call` for each call in progress.
     calls: HashMap<u32, HashSet<u32>>,
     jobs: Option<SyncSender<Job>>,
@@ -236,14 +310,29 @@ struct UnitScript {
 }
 
 impl UnitScript {
-    fn queue(&mut self, short_name: &str, unit: u32, action: Action, talkgroup: Option<u32>) {
-        let Some(target) = self.targets.get(short_name) else { return };
+    /// What to run for a site of a system: the site's own, else the system's. None for a site
+    /// the plugin is off for (calls as they go are the system's, and still come for it).
+    fn target(&self, short_name: &str, site_id: u32) -> Option<&Target> {
+        if site_id != 0 && self.sites_on.get(short_name).is_some_and(|on| !on.is_empty() && !on.contains(&site_id)) {
+            return None;
+        }
+        self.targets.get(&(short_name.to_string(), site_id)).or_else(|| self.targets.get(&(short_name.to_string(), 0)))
+    }
+
+    fn queue(&mut self, from: &Origin, unit: u32, action: Action, talkgroup: Option<u32>) {
+        let Some(target) = self.target(from.short_name, from.site_id) else { return };
         if !target.actions.contains(&action) {
             return;
         }
         let job = Job {
             target: target.clone(),
-            args: [short_name.to_string(), unit.to_string(), action.as_str().to_string(), talkgroup.map_or(String::new(), |t| t.to_string())],
+            args: [from.name().to_string(), unit.to_string(), action.as_str().to_string(), talkgroup.map_or(String::new(), |t| t.to_string())],
+            env: [
+                ("TR_SHORT_NAME", from.short_name.to_string()),
+                ("TR_SYSTEM_ID", id_text(from.system_id)),
+                ("TR_SITE", from.site.to_string()),
+                ("TR_SITE_ID", id_text(from.site_id)),
+            ],
         };
         let Some(tx) = &self.jobs else { return };
         match tx.try_send(job) {
@@ -270,8 +359,9 @@ impl UnitScript {
         if ended {
             self.calls.remove(&call.id);
         }
+        let from = Origin { short_name: &call.short_name, system_id: call.system_id, site: &call.site, site_id: call.site_id };
         for unit in new {
-            self.queue(&call.short_name, unit, Action::Call, Some(call.talkgroup));
+            self.queue(&from, unit, Action::Call, Some(call.talkgroup));
         }
     }
 }
@@ -330,6 +420,7 @@ fn work(host: Host, rx: Receiver<Job>, stats: Arc<Stats>) {
 fn run(job: &Job) -> std::io::Result<Option<String>> {
     let mut child = Command::new(&job.target.script)
         .args(&job.args)
+        .envs(job.env.iter().map(|(k, v)| (k, v)))
         .current_dir(&job.target.workdir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -365,21 +456,21 @@ fn run(job: &Job) -> std::io::Result<Option<String>> {
 
 impl Plugin for UnitScript {
     type Config = Config;
-    type SystemConfig = NoConfig;
+    type SystemConfig = Own;
 
     fn manifest() -> Manifest {
         Manifest {
             name: "Unit script".into(),
             subscribe: vec![topic::UNIT.into(), topic::CALL_START.into(), topic::CALL_END.into(), topic::CALL_CONCLUDED.into()],
-            // A system may set these again for itself (SDK 0.13.0+: a system's card
-            // offers only what the plugin names here). Systems and Include
-            // conventional systems stay whole-recorder settings.
-            system_overrides: vec!["script".into(), "workdir".into(), "actions".into(), "timeoutS".into()],
+            // A system sets these in its own settings (`Own`, on its card); a site of a
+            // system with several may set them again for itself (SDK 0.14.0+). Systems
+            // and Include conventional systems stay whole-recorder settings.
+            site_overrides: vec!["script".into(), "workdir".into(), "actions".into(), "timeoutS".into()],
             ..trunk_recorder_plugin::manifest!()
         }
     }
 
-    fn start(host: Host, setup: Setup<Config, NoConfig>) -> Result<Self, String> {
+    fn start(host: Host, setup: Setup<Config, Own>) -> Result<Self, String> {
         let chosen: HashSet<&str> = setup.config.systems.iter().map(String::as_str).collect();
         for name in &chosen {
             if setup.system_named(name).is_none() {
@@ -387,15 +478,33 @@ impl Plugin for UnitScript {
             }
         }
         let mut targets = HashMap::new();
+        let mut sites_on = HashMap::new();
         let mut left_out = Vec::new();
+        let mut lines = Vec::new();
         for s in &setup.systems {
             let wanted = if chosen.is_empty() { s.kind != "conventional" || setup.config.include_conventional } else { chosen.contains(s.short_name.as_str()) };
             if !wanted {
                 left_out.push(s.short_name.clone());
                 continue;
             }
-            if let Some(t) = Target::of(&s.short_name, &s.settings)? {
-                targets.insert(s.short_name.clone(), t);
+            sites_on.insert(s.short_name.clone(), s.sites.iter().map(|site| site.id).collect::<HashSet<u32>>());
+            // The system's: the plugin's with what the system set.
+            let system = s.config.as_ref().map_or_else(|| setup.config.clone(), |own| own.over(&setup.config));
+            let system_target = Target::of(&s.short_name, &system)?;
+            if let Some(t) = &system_target {
+                lines.push((s.short_name.clone(), t.clone()));
+                targets.insert((s.short_name.clone(), 0), t.clone());
+            }
+            // A site with settings of its own: the system's with what the site set again.
+            // `<shortName>` is the site's name only on a system with several sites.
+            for site in &s.sites {
+                let Some(own) = &site.config else { continue };
+                let label = format!("{} site {}", s.short_name, site.name);
+                // Only a site whose settings differ from its system's has its own.
+                if let Some(t) = Target::of(&label, &own.over(&system))?.filter(|t| system_target.as_ref() != Some(t)) {
+                    lines.push((label, t.clone()));
+                    targets.insert((s.short_name.clone(), site.id), t);
+                }
             }
         }
         if !left_out.is_empty() {
@@ -409,23 +518,28 @@ impl Plugin for UnitScript {
                 "No system runs the script: tick some under Systems, or turn on Include conventional systems.".into()
             });
         }
-        for (name, t) in &targets {
+        lines.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, t) in &lines {
             let mut actions: Vec<&str> = t.actions.iter().map(|a| a.as_str()).collect();
             actions.sort_unstable();
             host.info(format!("{name}: {} in {} for {}", t.script.display(), t.workdir.display(), actions.join(", ")));
         }
+        let systems: HashSet<&String> = targets.keys().map(|(name, _)| name).collect();
+        let sites = targets.keys().filter(|(_, site)| *site != 0).count();
         let (tx, rx) = mpsc::sync_channel(QUEUE);
         let stats = Arc::new(Stats::default());
         let (worker_host, worker_stats) = (host.clone(), stats.clone());
         let worker = thread::spawn(move || work(worker_host, rx, worker_stats));
-        host.status(State::Ok, format!("running the script for {} system(s)", targets.len()));
+        let own = if sites == 0 { String::new() } else { format!(", {sites} site(s) with their own") };
+        host.status(State::Ok, format!("running the script for {} system(s){own}", systems.len()));
         host.metrics(&stats.metrics());
-        Ok(UnitScript { host, targets, calls: HashMap::new(), jobs: Some(tx), worker: Some(worker), stats })
+        Ok(UnitScript { host, targets, sites_on, calls: HashMap::new(), jobs: Some(tx), worker: Some(worker), stats })
     }
 
     fn unit(&mut self, e: UnitEvent) {
         if let Some(action) = Action::of_kind(&e.kind) {
-            self.queue(&e.short_name, e.unit, action, e.talkgroup);
+            let from = Origin { short_name: &e.short_name, system_id: e.system_id, site: &e.site, site_id: e.site_id };
+            self.queue(&from, e.unit, action, e.talkgroup);
         }
     }
 
@@ -442,10 +556,11 @@ impl Plugin for UnitScript {
     /// success, age at delivery). The radios heard were passed to the script as the call
     /// ended, so there is nothing more to wait for: say what became of the call now.
     fn call_concluded(&mut self, call: ConcludedCall) {
-        let (outcome, message) = match self.targets.get(call.call.short_name.as_str()) {
+        // The settings of the site its kept copy is from, as for its radios as it ended.
+        let (outcome, message) = match self.target(&call.call.short_name, call.call.site_id) {
             Some(t) if t.actions.contains(&Action::Call) => (Outcome::Ok, ""),
-            Some(_) => (Outcome::Skipped, "the call action is off for this system"),
-            None => (Outcome::Skipped, "this system doesn't run the script"),
+            Some(_) => (Outcome::Skipped, "the call action is off for this system or site"),
+            None => (Outcome::Skipped, "this system or site doesn't run the script"),
         };
         self.host.call_result(&call.path, outcome, message, "");
     }
@@ -475,7 +590,7 @@ mod tests {
     /// A script that appends its working folder and arguments to `calls.log`.
     fn script(dir: &Path) -> PathBuf {
         let p = dir.join("unit.sh");
-        std::fs::write(&p, "#!/bin/sh\necho \"$(pwd) | $*\" >> calls.log\n").unwrap();
+        std::fs::write(&p, "#!/bin/sh\necho \"$(pwd) | $* | $TR_SHORT_NAME,$TR_SYSTEM_ID,$TR_SITE,$TR_SITE_ID\" >> calls.log\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -554,26 +669,127 @@ mod tests {
         let dir = testing::temp_dir("unit-script");
         let s = script(&dir);
         let mut hello = testing::hello(&dir, json!({ "script": s }));
-        // The host sends a system's settings whole: the plugin's own, with its overrides applied.
-        hello.systems[0].settings = json!({ "script": s, "actions": ["ackresp"] });
+        // The system's own settings: empty ones are the plugin's.
+        hello.systems[0].config = json!({ "actions": ["ackresp"] });
         let out = testing::run::<UnitScript>([HostMessage::Hello(hello), unit("affiliation", 1, Some(2)), unit("acknowledge", 3, None)]);
         assert!(out.ready());
         assert_eq!(log(&dir), ["sys1 3 ackresp "]);
     }
 
-    /// Every setting the manifest lets a system set again is one the form has.
+    /// Every setting a site may set again is one of a system's, and none is whole-recorder.
     #[test]
-    fn overrides_are_settings_the_plugin_has() {
+    fn site_overrides_are_settings_a_system_has() {
         let manifest = <UnitScript as Plugin>::manifest();
-        let schema = serde_json::to_value(schemars::schema_for!(Config)).unwrap();
+        assert!(manifest.system_overrides.is_empty(), "a system's are its own settings, not overrides of the plugin's");
+        let schema = serde_json::to_value(schemars::schema_for!(Own)).unwrap();
         let props = schema["properties"].as_object().expect("properties");
-        assert!(!manifest.system_overrides.is_empty());
-        for name in &manifest.system_overrides {
-            assert!(props.contains_key(name), "{name} is not a setting");
+        assert!(!manifest.site_overrides.is_empty());
+        for name in &manifest.site_overrides {
+            assert!(props.contains_key(name), "{name} is not a system setting");
         }
         for whole_recorder in ["systems", "includeConventional"] {
-            assert!(!manifest.system_overrides.iter().any(|n| n == whole_recorder), "{whole_recorder} must stay whole-recorder");
+            assert!(!props.contains_key(whole_recorder), "{whole_recorder} must stay whole-recorder");
         }
+    }
+
+    /// The env the script ran with: `TR_SHORT_NAME,TR_SYSTEM_ID,TR_SITE,TR_SITE_ID` per run.
+    fn envs(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("calls.log")).unwrap_or_default().lines().map(|l| l.split(" | ").nth(2).unwrap().to_string()).collect()
+    }
+
+    /// A hello whose `sys1` (id 7) has the sites `north` (11, as the system) and `south`
+    /// (12, with `south` as its own settings).
+    fn two_sites(dir: &Path, config: Value, south: Value) -> trunk_recorder_plugin::Hello {
+        let mut hello = testing::hello(dir, config);
+        hello.systems[0].id = 7;
+        hello.systems[0].sites = vec![
+            trunk_recorder_plugin::SiteInfo { id: 11, name: "north".into(), config: Value::Null },
+            trunk_recorder_plugin::SiteInfo { id: 12, name: "south".into(), config: south },
+        ];
+        hello
+    }
+
+    fn unit_at(site: &str, site_id: u32, kind: &str, unit: u32) -> HostMessage {
+        HostMessage::Unit(UnitEvent { short_name: "sys1".into(), system_id: 7, site: site.into(), site_id, kind: kind.into(), unit, ..Default::default() })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_site_runs_its_own_script_named_for_the_site() {
+        let dir = testing::temp_dir("unit-script");
+        let s = script(&dir);
+        let south_dir = dir.join("south");
+        std::fs::create_dir_all(&south_dir).unwrap();
+        let s2 = script(&south_dir);
+        let mut south_call = call(5, 100, &[3]);
+        (south_call.system_id, south_call.site, south_call.site_id) = (7, "south".into(), 12);
+        let out = testing::run::<UnitScript>([
+            HostMessage::Hello(two_sites(&dir, json!({ "script": s }), json!({ "script": s2 }))),
+            unit_at("north", 11, "registration", 1),
+            unit_at("south", 12, "registration", 2),
+            HostMessage::CallStart(south_call),
+        ]);
+        assert!(out.ready());
+        assert_eq!(log(&dir), ["north 1 on "], "north has none of its own: the system's script, named for the site");
+        assert_eq!(envs(&dir), ["sys1,7,north,11"]);
+        assert_eq!(log(&south_dir), ["south 2 on ", "south 3 call 100"], "south's own script");
+        assert_eq!(envs(&south_dir), ["sys1,7,south,12", "sys1,7,south,12"]);
+        assert!(out.status().is_some_and(|(_, m)| m.contains("1 site(s) with their own")), "{:?}", out.status());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_site_with_its_systems_settings_has_none_of_its_own() {
+        let dir = testing::temp_dir("unit-script");
+        let s = script(&dir);
+        let out = testing::run::<UnitScript>([HostMessage::Hello(two_sites(&dir, json!({ "script": s }), json!({ "script": s })))]);
+        assert!(out.ready());
+        assert!(out.status().is_some_and(|(_, m)| m == "running the script for 1 system(s)"), "{:?}", out.status());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_system_of_one_site_is_named_by_its_short_name() {
+        // Its one site is named for the system; an event with no site (conventional) is too.
+        let dir = testing::temp_dir("unit-script");
+        let s = script(&dir);
+        let mut hello = testing::hello(&dir, json!({ "script": s }));
+        hello.systems[0].sites = vec![trunk_recorder_plugin::SiteInfo { id: 11, name: "sys1".into(), config: Value::Null }];
+        let out = testing::run::<UnitScript>([HostMessage::Hello(hello), unit_at("sys1", 11, "registration", 1), unit("registration", 2, None)]);
+        assert!(out.ready());
+        assert_eq!(log(&dir), ["sys1 1 on ", "sys1 2 on "]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_site_the_plugin_is_off_for_runs_nothing() {
+        // Calls as they go are the system's and still come from a site turned off (13).
+        let dir = testing::temp_dir("unit-script");
+        let s = script(&dir);
+        let mut off_call = call(5, 100, &[3]);
+        (off_call.site, off_call.site_id) = ("east".into(), 13);
+        let out = testing::run::<UnitScript>([HostMessage::Hello(two_sites(&dir, json!({ "script": s }), Value::Null)), HostMessage::CallStart(off_call)]);
+        assert!(out.ready());
+        assert!(log(&dir).is_empty(), "{:?}", log(&dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_call_is_reported_by_its_site() {
+        let dir = testing::temp_dir("unit-script");
+        let s = script(&dir);
+        let mut north = testing::call(&dir, "sys1", 100);
+        (north.call.site, north.call.site_id) = ("north".into(), 11);
+        let mut south = testing::call(&dir, "sys1", 200);
+        (south.call.site, south.call.site_id) = ("south".into(), 12);
+        let out = testing::run::<UnitScript>([
+            HostMessage::Hello(two_sites(&dir, json!({ "script": s }), json!({ "actions": ["on"] }))),
+            HostMessage::CallConcluded(north),
+            HostMessage::CallConcluded(south),
+        ]);
+        assert!(out.ready());
+        let outcomes: Vec<Outcome> = out.results().into_iter().map(|r| r.1).collect();
+        assert_eq!(outcomes, [Outcome::Ok, Outcome::Skipped], "south passes `on` only");
     }
 
     #[cfg(unix)]

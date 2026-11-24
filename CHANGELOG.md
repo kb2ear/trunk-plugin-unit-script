@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.0]
+
+- **A script for each site.** A system with several sites has a row for each on its card, where a
+  site can set **Script**, **Working folder**, **Actions** and **Timeout** again (empty: the
+  system's). Each event goes by its site: a unit event by the site whose control channel told it,
+  a call's radios by the site that had the call first, a recorded call by the site of its kept
+  copy. A call from a site the plugin is off for runs nothing.
+- **`shortName` is the site's name on a system with several sites**, as when each site was a
+  system of its own in Trunk Recorder. A system of one site, and a conventional system, still pass
+  the system's short name.
+- The script gets `TR_SHORT_NAME`, `TR_SYSTEM_ID`, `TR_SITE` and `TR_SITE_ID` in its environment.
+- **Upgrading:** a system's settings are now its own (the plugin's per-system settings) rather
+  than overrides of the plugin's. A Script, Working folder, Actions or Timeout a system set with
+  0.1.2 or 0.1.3 is ignored, and its card offers **Remove**: set it again under the system's
+  Unit script settings. The plugin's own settings carry over unchanged.
+
 ## [0.1.3]
 
 - **The card reports on every recorded call, like other plugins**: Sent, Skipped, Last result,

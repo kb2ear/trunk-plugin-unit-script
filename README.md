@@ -20,6 +20,18 @@ For each event it runs:
 Only the actions ticked under **Actions** are passed on; by default `on`, `off`, `join`, `call`
 and `location`.
 
+`shortName` is the system's short name, except on a system with several sites, where it is the
+name of the site the event came from (in Trunk Recorder each site was a system of its own). A
+system of one site names that site by its short name, and a conventional system has no sites, so
+both get the short name. The script also gets these in its environment:
+
+| Variable | |
+|---|---|
+| `TR_SHORT_NAME` | The system's short name, whatever `shortName` is |
+| `TR_SYSTEM_ID` | The system's id: the same across renames |
+| `TR_SITE` | The site's name; empty for a conventional system |
+| `TR_SITE_ID` | The site's id; empty for a conventional system |
+
 ## Settings
 
 | Setting | Default | |
@@ -36,19 +48,27 @@ you tick them or turn on **Include conventional systems**. They have no registra
 affiliations, so for them the script only gets `call`, for each radio heard (P25 / DMR IDs, MDC,
 FleetSync). The plugin's log names the systems left out at start.
 
-A system can override Script, Working folder, Actions and Timeout for itself (on its card under
-**Plugins** > **Unit script**), to run another script for it. Those four are the only settings a
-system can set again; **Systems** and **Include conventional systems** are for the whole recorder.
-This needs Trunk Recorder Pro 0.4.0 or later (plugin SDK 0.13.0+), where a system's card offers
-only the settings its plugin names. The recorder's own **Systems** switch on a plugin's card
-(Setup > Plugins) also turns this plugin off for a system, beside this plugin's own **Systems**.
+### For a system, and each site
+
+A system can have its own **Script**, **Working folder**, **Actions** and **Timeout** (on its
+card under **Plugins** > **Unit script**); empty ones are the plugin's. A system with several
+sites has a row for each site there, where a site can set those four again; empty ones are the
+system's. So each site can run a script of its own, as each site's system could in Trunk
+Recorder. A working folder left empty everywhere is the script's own folder.
+
+Events go by the site they came from: a unit event by the site whose control channel told it, a
+call's radios by the site that had the call first, and a recorded call (for the card) by the site
+its copy was kept from. **Systems** and **Include conventional systems** are for the whole
+recorder. The recorder's own switches on the plugin's card (Setup > Plugins) turn it off for a
+system or a site; a call from a site it's off for runs nothing. Sites need Trunk Recorder Pro
+0.4.0 or later (plugin SDK 0.14.0+).
 
 ## How it runs
 
 - Runs happen one at a time, in order, on a thread of their own: a slow script never holds up the
   recorder. Up to 5000 runs can wait; past that, events are dropped and the plugin's card warns.
 - The plugin's card counts recorded calls as other plugins' do: **Sent** for a call from a system
-  that runs the script for `call`, **Skipped** for one that doesn't (a conventional system left
+  or site that runs the script for `call`, **Skipped** for one that doesn't (a conventional system left
   out, or `call` not ticked under **Actions**), with **Last success** and the age at delivery to
   match. The plugin reports on each call as soon as it is recorded, so it never holds a call's
   files back from the recorder's **Archive** settings. Failed scripts aren't failed calls: they
@@ -61,6 +81,7 @@ only the settings its plugin names. The recorder's own **Systems** switch on a p
 ## Differences from Trunk Recorder
 
 - `call_alert` and `emergency` are new (Trunk Recorder has no such actions).
+- The `TR_*` environment variables are new.
 - `on` and `off` pass an empty talkgroup.
 
 ## Building
